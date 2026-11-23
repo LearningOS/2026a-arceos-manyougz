@@ -165,6 +165,47 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        let src = src_path.trim_matches('/');
+        let dst = dst_path.trim_matches('/');
+        let (src_dir, old_name) = src.rsplit_once('/').unwrap_or(("", src));
+        let (dst_dir, new_name) = dst.rsplit_once('/').unwrap_or(("", dst));
+        if src_dir != dst_dir {
+            return Err(VfsError::Unsupported);
+        }
+        if matches!(old_name, "" | "." | "..") || matches!(new_name, "" | "." | "..") {
+            return Err(VfsError::InvalidInput);
+        }
+
+        let parent = self
+            .this
+            .upgrade()
+            .ok_or(VfsError::NotFound)?
+            .lookup(src_dir)?;
+        let dir = parent
+            .as_any()
+            .downcast_ref::<DirNode>()
+            .ok_or(VfsError::NotADirectory)?;
+        let mut children = dir.children.write();
+        let node = children.get(old_name).ok_or(VfsError::NotFound)?;
+        if node.get_attr()?.is_dir() {
+            return Err(VfsError::IsADirectory);
+        }
+        if old_name == new_name {
+            return Ok(());
+        }
+        if let Some(dst) = children.get(new_name) {
+            if dst.get_attr()?.is_dir() {
+                return Err(VfsError::IsADirectory);
+            }
+        }
+
+        // 只改目录项的名称，已打开的文件仍然引用原来的节点。
+        let node = children.remove(old_name).unwrap();
+        children.insert(new_name.into(), node);
+        Ok(())
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
 }
 

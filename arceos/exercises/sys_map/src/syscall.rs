@@ -1,13 +1,16 @@
 #![allow(dead_code)]
 
 use core::ffi::{c_void, c_char, c_int};
+use alloc::vec::Vec;
 use axhal::arch::TrapFrame;
+use axhal::mem::{VirtAddr, PAGE_SIZE_4K};
 use axhal::trap::{register_trap_handler, SYSCALL};
 use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use memory_addr::VirtAddrRange;
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -131,16 +134,67 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    syscall_body!(sys_mmap, {
+        let prot = MmapProt::from_bits(prot).ok_or(LinuxError::EINVAL)?;
+        if length == 0 || offset < 0 || offset as usize % PAGE_SIZE_4K != 0 || prot.is_empty() {
+            return Err(LinuxError::EINVAL);
+        }
+        if flags != MmapFlags::MAP_PRIVATE.bits() {
+            return Err(LinuxError::ENOSYS);
+        }
+        let size = length
+            .checked_add(PAGE_SIZE_4K - 1)
+            .ok_or(LinuxError::ENOMEM)? & !(PAGE_SIZE_4K - 1);
+
+        let file = api::get_file_like(fd)?;
+        let file_size = file.stat()?.st_size as usize;
+        let mut data = Vec::new();
+        let read_len = file_size.saturating_sub(offset as usize).min(length);
+        data.try_reserve_exact(read_len).map_err(|_| LinuxError::ENOMEM)?;
+        data.resize(read_len, 0);
+
+        let old_pos = api::sys_lseek(fd, 0, 1);
+        if old_pos < 0 || api::sys_lseek(fd, offset as _, 0) < 0 {
+            return Err(LinuxError::EBADF);
+        }
+        let read_result = (|| -> axerrno::LinuxResult<usize> {
+            let mut read = 0;
+            while read < data.len() {
+                let n = file.read(&mut data[read..])?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+            Ok(read)
+        })();
+        api::sys_lseek(fd, old_pos, 0);
+        let read = read_result?;
+
+        let task = current();
+        let mut aspace = task.task_ext().aspace.lock();
+        let base = aspace.base() + PAGE_SIZE_4K;
+        let limit = VirtAddrRange::from_start_size(base, aspace.end() - base);
+        let hint = VirtAddr::from(addr as usize & !(PAGE_SIZE_4K - 1));
+        let hint = if hint >= base && hint < aspace.end() { hint } else { base };
+        let start = aspace
+            .find_free_area(hint, size, limit)
+            .or_else(|| aspace.find_free_area(base, size, limit))
+            .ok_or(LinuxError::ENOMEM)?;
+
+        // 先分配用户页，再通过内核映射写入文件内容。
+        aspace.map_alloc(start, size, prot.into(), true)?;
+        aspace.write(start, &data[..read])?;
+        Ok(usize::from(start))
+    })
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
